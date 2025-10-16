@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 BASE_URL = "https://client.webhostmost.com"
 LOGIN_URL = f"{BASE_URL}/login"
 REDIRECT_URL = f"{BASE_URL}/clientarea.php"
-EMAIL_FIELD = "username"
-PASSWORD_FIELD = "password"
+EMAIL_FIELD = "chenglizhi.com@gmail.com"
+PASSWORD_FIELD = "17322274708lizhi"
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 # -----------------------------------------------------------------------
