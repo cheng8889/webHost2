@@ -1,190 +1,290 @@
-import requests
+#!/usr/bin/env python3
+"""
+Automated login helper for the Webhostmost client area.
+The script is designed to be executed within GitHub Actions using Playwright
+and relies on credentials passed via environment variables.
+"""
+ 
+from __future__ import annotations
+ 
 import os
 import sys
-import re
-from datetime import datetime, timedelta
-
-# -----------------------------------------------------------------------
-BASE_URL = "https://client.webhostmost.com"
-LOGIN_URL = f"{BASE_URL}/login"
-REDIRECT_URL = f"{BASE_URL}/clientarea.php"
-EMAIL_FIELD = "username"
-PASSWORD_FIELD = "password"
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-# -----------------------------------------------------------------------
-
-
-def parse_users(users_secret):
-    """解析 GitHub Secret 格式：邮箱:密码\\n邮箱2:密码2"""
-    users = []
-    if not users_secret:
-        print("❌ 未找到 WHM_ACCOUNT 环境变量中的用户数据。")
-        return users
-
-    for line in users_secret.strip().split('\n'):
-        parts = line.strip().split(':', 1)
-        if len(parts) == 2:
-            email, password = parts[0].strip(), parts[1].strip()
-            users.append({'email': email, 'password': password})
-        else:
-            print(f"⚠️ 跳过格式错误的行: {line}")
-    return users
-
-def get_csrf_token(session):
-    """从登录页提取 CSRF Token"""
+import time
+from typing import Iterable, Optional
+ 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+ 
+LOGIN_URL = "https://client.webhostmost.com/clientarea.php"
+CLOUDFLARE_TIMEOUT_SECONDS = 30
+CLOUDFLARE_POLL_INTERVAL_SECONDS = 2
+MAX_ATTEMPTS = 3
+TWO_FACTOR_EXIT_CODE = 2
+TRANSIENT_EXIT_CODE = 3
+ 
+ 
+class TwoFactorOrCaptchaDetected(Exception):
+    """Raised when the login flow encounters a 2FA or CAPTCHA requirement."""
+ 
+ 
+class TransientPageState(Exception):
+    """Raised for transient issues (e.g., Cloudflare interstitial) to trigger retries."""
+ 
+ 
+def main() -> int:
+    email = os.environ.get("WEBHOSTMOST_EMAIL")
+    password = os.environ.get("WEBHOSTMOST_PASSWORD")
+ 
+    env_pairs = (
+        ("WEBHOSTMOST_EMAIL", email),
+        ("WEBHOSTMOST_PASSWORD", password),
+    )
+    missing = [name for name, value in env_pairs if not value]
+    if missing:
+        print(
+            "Missing required environment variables: " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        return 1
+ 
     try:
-        r = session.get(LOGIN_URL, timeout=15)
-        r.raise_for_status()
-        match = re.search(r'name="token"\s+value="([^"]+)"', r.text)
-        if match:
-            token = match.group(1)
-            print(f"🔑 获取到 CSRF Token: {token[:8]}...")
-            return token
-        else:
-            print("⚠️ 未找到 CSRF Token，可能页面结构已变。")
-            return None
-    except requests.RequestException as e:
-        print(f"❌ 获取登录页时出错: {e}")
-        return None
-
-def extract_remaining_days():
-    """
-    精确计算剩余天数（向下取整）
-    """
-    TOTAL_DAYS = 45
-    now = datetime.now()
-    end_time = now + timedelta(days=TOTAL_DAYS)  # JS 逻辑: 登录时 + 45天
-    remaining_timedelta = end_time - now
-    remaining_days = remaining_timedelta.days
-    return remaining_days
-
-def attempt_login(email, password):
-    """尝试登录并返回结果与剩余时间"""
-    session = requests.Session()
-    print(f"\n👤 尝试登录用户：{email}")
-
-    token = get_csrf_token(session)
-    if not token:
-        print("⚠️ 获取 CSRF Token 失败，跳过此账号。")
-        return {"email": email, "success": False, "reason": "无法获取 CSRF Token"}
-
-    payload = {
-        EMAIL_FIELD: email,
-        PASSWORD_FIELD: password,
-        "token": token,
-        "rememberme": "on",
-    }
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": LOGIN_URL,
-        "Origin": BASE_URL,
-    }
-
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = None
+                try:
+                    context = browser.new_context()
+                    attempt_login_with_retries(context, email, password)
+                finally:
+                    if context is not None:
+                        context.close()
+            finally:
+                browser.close()
+    except TwoFactorOrCaptchaDetected as exc:
+        print(str(exc), file=sys.stderr)
+        return TWO_FACTOR_EXIT_CODE
+    except TransientPageState as exc:
+        print(f"Login attempt encountered a transient issue: {exc}", file=sys.stderr)
+        return TRANSIENT_EXIT_CODE
+    except Exception as exc:  # noqa: BLE001
+        print(f"Login attempt failed: {exc}", file=sys.stderr)
+        return 1
+ 
+    print("Login succeeded")
+    return 0
+ 
+ 
+def attempt_login_with_retries(context, email: str, password: str) -> None:
+    """Attempt the login flow, retrying transient failures a limited number of times."""
+    last_error: Optional[Exception] = None
+ 
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        page = context.new_page()
+        try:
+            perform_login_flow(page, email, password)
+            page.close()
+            return
+        except TransientPageState as exc:
+            last_error = exc
+        except Exception:
+            page.close()
+            raise
+        page.close()
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(3)
+ 
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Login attempts exhausted without success.")
+ 
+ 
+def perform_login_flow(page, email: str, password: str) -> None:
+    navigate_to_login(page)
+ 
+    if message := detect_twofactor_or_captcha(page):
+        raise TwoFactorOrCaptchaDetected(message)
+ 
+    if not fill_first_available_field(
+        page,
+        (
+            "input[name='username']",
+            "input[name='email']",
+            "#inputEmail",
+            "input[type='email']",
+        ),
+        email,
+    ):
+        raise RuntimeError("Unable to locate username/email input field.")
+ 
+    if not fill_first_available_field(
+        page,
+        (
+            "input[name='password']",
+            "#inputPassword",
+            "input[type='password']",
+        ),
+        password,
+    ):
+        raise RuntimeError("Unable to locate password input field.")
+ 
+    if not click_first_available(
+        page,
+        (
+            "button[type='submit']",
+            "button#login",
+            "text=Login",
+        ),
+    ):
+        raise RuntimeError("Unable to locate login submit button.")
+ 
+    # Give the page a moment to navigate and load.
     try:
-        response = session.post(LOGIN_URL, data=payload, headers=headers, allow_redirects=True, timeout=15)
-
-        if REDIRECT_URL in response.url or "clientarea.php" in response.text.lower():
-            print(f"✅ 成功登录用户 {email}，正在解析剩余时间...")
-            remaining_days = extract_remaining_days()
-            if remaining_days is not None:
-                print(f"📆 剩余时间: {remaining_days} 天")
-            else:
-                print("⚠️ 无法获取剩余时间。")
-            return {"email": email, "success": True, "days": remaining_days}
-
-        elif "incorrect" in response.text.lower():
-            print(f"❌ 登录失败：账号或密码错误。用户 {email}")
-            return {"email": email, "success": False, "reason": "账号或密码错误"}
-
-        elif "Invalid CSRF token" in response.text:
-            print(f"❌ 登录失败：Token 无效。用户 {email}")
-            return {"email": email, "success": False, "reason": "CSRF Token 无效"}
-
-        else:
-            print(f"⚠️ 登录失败：未知原因。URL: {response.url}")
-            return {"email": email, "success": False, "reason": "未知错误"}
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ 登录用户 {email} 时发生错误: {e}")
-        return {"email": email, "success": False, "reason": str(e)}
-
-
-def send_tg_message(message):
-    """通过 Telegram 发送通知"""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ 未设置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 通知。")
-        return
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-
+        page.wait_for_load_state("networkidle", timeout=15_000)
+    except PlaywrightTimeoutError:
+        # Not fatal; we will continue to verification and challenges detection.
+        pass
+ 
+    wait_for_cloudflare(page)
+ 
+    if message := detect_twofactor_or_captcha(page):
+        raise TwoFactorOrCaptchaDetected(message)
+ 
+    if not login_successful(page):
+        raise RuntimeError("Login verification failed.")
+ 
+ 
+def navigate_to_login(page) -> None:
     try:
-        r = requests.post(url, data=data, timeout=10)
-        if r.status_code == 200:
-            print("📨 Telegram 通知已发送。")
-        else:
-            print(f"⚠️ Telegram 通知发送失败: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"⚠️ Telegram 通知错误: {e}")
-
-
-def main():
-    user_credentials_secret = os.getenv('WHM_ACCOUNT')
-
-    if not user_credentials_secret:
-        print("错误：未设置 WHM_ACCOUNT 环境变量。请在 GitHub Secrets 中配置。")
-        sys.exit(1)
-
-    users = parse_users(user_credentials_secret)
-    if not users:
-        print("未解析到任何用户。退出。")
-        sys.exit(1)
-
-    results = []
-    for user in users:
-        result = attempt_login(user['email'], user['password'])
-        results.append(result)
-
-    # 统计结果
-    total = len(results)
-    success = sum(1 for r in results if r["success"])
-    failed = total - success
-
-    # 生成报告
-    report_lines = [
-        "🌐 *webhostmost 登录报告*",
-        "===================",
-        f"👥 共处理账号: {total} 个",
-        f"✅ 登录成功: {success} 个",
-        f"❌ 登录失败: {failed} 个",
-        "===================",
-        "📋 登录详情："
-    ]
-
-    for r in results:
-        if r["success"]:
-            days_text = f" 剩余时间 {r['days']} 天" if r.get("days") else " 剩余时间未知"
-            report_lines.append(f"🟢 {r['email']} 登录成功，{days_text}")
-        else:
-            report_lines.append(f"🔴 {r['email']} 登录失败，原因：{r.get('reason', '未知错误')}")
-
-    message = "\n".join(report_lines)
-    print("\n" + message)
-
-    # 发送 Telegram 通知
-    send_tg_message(message)
-
-    # 所有失败则报错退出
-    if success == 0:
-        print("❌ 所有账号登录失败，脚本退出。")
-        sys.exit(1)
-
-
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+    except PlaywrightTimeoutError as exc:
+        raise TransientPageState("Timed out navigating to login page.") from exc
+ 
+    wait_for_cloudflare(page)
+ 
+ 
+def wait_for_cloudflare(page) -> None:
+    deadline = time.time() + CLOUDFLARE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if not has_cloudflare_interstitial(page):
+            return
+        page.wait_for_timeout(CLOUDFLARE_POLL_INTERVAL_SECONDS * 1_000)
+    raise TransientPageState("Cloudflare interstitial did not clear within timeout.")
+ 
+ 
+def has_cloudflare_interstitial(page) -> bool:
+    try:
+        body_text = page.text_content("body", timeout=2_000) or ""
+    except PlaywrightTimeoutError:
+        return False
+ 
+    lowered = body_text.lower()
+    indicators = (
+        "checking your browser",
+        "just a moment",
+        "please stand by",
+        "ddos protection by cloudflare",
+    )
+    return any(indicator in lowered for indicator in indicators)
+ 
+ 
+def fill_first_available_field(page, selectors: Iterable[str], value: str) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            if locator.count() == 0:
+                continue
+            target = locator.first
+            target.wait_for(state="visible", timeout=5_000)
+            target.fill(value)
+            return True
+        except PlaywrightTimeoutError:
+            continue
+        except Exception:
+            continue
+    return False
+ 
+ 
+def click_first_available(page, selectors: Iterable[str]) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            if locator.count() == 0:
+                continue
+            target = locator.first
+            target.wait_for(state="visible", timeout=5_000)
+            target.click()
+            return True
+        except PlaywrightTimeoutError:
+            continue
+        except Exception:
+            continue
+    return False
+ 
+ 
+def detect_twofactor_or_captcha(page) -> Optional[str]:
+    twofactor_selectors = (
+        "input[name*='twofactor']",
+        "input[name*='2fa']",
+        "input[id*='twofactor']",
+        "input[id*='2fa']",
+        "input[name='token']",
+        "input[name='code']",
+    )
+    captcha_selectors = (
+        "iframe[src*='recaptcha']",
+        "iframe[src*='hcaptcha']",
+        "div.g-recaptcha",
+        "div.h-captcha",
+    )
+ 
+    for selector in twofactor_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return "Two-factor authentication challenge detected."
+        except Exception:
+            continue
+ 
+    for selector in captcha_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return "CAPTCHA challenge detected."
+        except Exception:
+            continue
+ 
+    try:
+        body_text = page.text_content("body", timeout=2_000) or ""
+    except PlaywrightTimeoutError:
+        body_text = ""
+ 
+    lowered = body_text.lower()
+    if "two-factor" in lowered or "verification code" in lowered:
+        return "Two-factor authentication challenge detected."
+    if "captcha" in lowered:
+        return "CAPTCHA challenge detected."
+ 
+    return None
+ 
+ 
+def login_successful(page) -> bool:
+    url = page.url.lower()
+    if "clientarea" in url and "login" not in url:
+        return True
+ 
+    logout_selectors = (
+        "a[href*='logout']",
+        "text=Logout",
+        "text=Log Out",
+    )
+ 
+    for selector in logout_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            continue
+ 
+    return False
+ 
+ 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
